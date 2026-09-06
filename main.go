@@ -7,6 +7,7 @@ import (
 	"log"
 	"log/slog"
 	"os"
+	"os/exec"
 	"strings"
 	"time"
 
@@ -79,7 +80,13 @@ func onReady() {
 
 	// systray.AddSeparator()
 
+	restartItem := systray.AddMenuItem("Restart", "")
 	quitItem := systray.AddMenuItem("Quit", "")
+
+	go func() {
+		<-restartItem.ClickedCh
+		restartApp()
+	}()
 
 	go func() {
 		<-quitItem.ClickedCh
@@ -105,6 +112,24 @@ func onReady() {
 			<-time.Tick(updateInterval)
 		}
 	}()
+}
+
+// restartApp spawns a new instance of the app with the same arguments,
+// then quits the current instance so the tray icon is cleaned up properly.
+func restartApp() {
+	exe, err := os.Executable()
+	if err != nil {
+		slog.Error("failed to restart", "error", err)
+		return
+	}
+	cmd := exec.Command(exe, os.Args[1:]...)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	if err := cmd.Start(); err != nil {
+		slog.Error("failed to restart", "error", err)
+		return
+	}
+	systray.Quit()
 }
 
 func updateValues(availableItem *systray.MenuItem) {
