@@ -1,9 +1,13 @@
 package main
 
 import (
+	"bytes"
 	_ "embed"
 	"flag"
 	"fmt"
+	"image"
+	"image/color"
+	"image/png"
 	"log"
 	"log/slog"
 	"os"
@@ -11,14 +15,25 @@ import (
 	"strings"
 	"time"
 
-	"github.com/getlantern/systray"
+	"fyne.io/systray"
 	"golang.org/x/sys/unix"
 )
 
 const (
-	updateInterval = 5 * time.Second
-	gb             = 1000 * 1000 * 1000
-	appName        = "dftray"
+	gb      = 1000 * 1000 * 1000
+	appName = "dftray"
+)
+
+// measurement represents a disk stats measurement.
+// values are in bytes.
+type measurement struct {
+	available uint64
+	total     uint64
+}
+
+var (
+	colorDarkError      = color.NRGBA{R: 0xf4, G: 0x43, B: 0x36, A: 0xff}
+	colorDarkForeground = color.NRGBA{R: 0xf3, G: 0xf3, B: 0xf3, A: 0xff}
 )
 
 //go:embed icon.png
@@ -32,9 +47,16 @@ var logLevelMap = map[string]slog.Level{
 }
 
 var (
-	intervalFlag = flag.Int("interval", 5, "update interval in seconds")
-	pathFlag     = flag.String("path", "/", "path used to query disk stats")
+	intervalFlag = flag.Int("interval", 10, "update interval in seconds")
+	limitFlag    = flag.Float64("limit", 10.0, "lower storage limit in GB")
 	logLevelFlag = flag.String("log-level", "warn", "log level used by the app")
+	pathFlag     = flag.String("path", "/", "path used to query disk stats")
+)
+
+var (
+	isTriggered bool
+	iconNormal  []byte
+	iconError   []byte
 )
 
 func main() {
@@ -44,27 +66,32 @@ func main() {
 		log.Fatal("interval must be 1 or larger")
 	}
 
+	if !(*limitFlag >= 0) {
+		log.Fatal("limit must be 0 or larger")
+	}
+
 	l, ok := logLevelMap[strings.ToLower(*logLevelFlag)]
 	if !ok {
 		log.Fatalf("invalid log level: %s", *logLevelFlag)
 	}
 	slog.SetLogLoggerLevel(l)
 
-	os.Setenv("GDK_BACKEND", "x11") // see systray issue #166
-
 	systray.Run(onReady, nil)
 }
 
-// measurement represents a disk stats measurement.
-// values are in bytes.
-type measurement struct {
-	available uint64
-	total     uint64
-}
-
 func onReady() {
-	systray.SetIcon(iconPNGData)
-	systray.SetTitle("...")
+	themedIcon := func(c color.Color) []byte {
+		themed, err := themedPNG(iconPNGData, c)
+		if err != nil {
+			slog.Warn("Failed to theme icon", "error", err)
+			return iconPNGData
+		}
+		return themed
+	}
+	iconNormal = themedIcon(colorDarkForeground)
+	iconError = themedIcon(colorDarkError)
+
+	systray.SetIcon(iconNormal)
 
 	x := systray.AddMenuItem(appName, "")
 	x.Disable()
@@ -76,16 +103,14 @@ func onReady() {
 
 	systray.AddSeparator()
 
-	// notifyItem := systray.AddMenuItem("Notify", "")
-
-	// systray.AddSeparator()
-
 	restartItem := systray.AddMenuItem("Restart", "")
 	quitItem := systray.AddMenuItem("Quit", "")
 
 	go func() {
-		<-restartItem.ClickedCh
-		restartApp()
+		for {
+			<-restartItem.ClickedCh
+			restartApp()
+		}
 	}()
 
 	go func() {
@@ -93,23 +118,12 @@ func onReady() {
 		systray.Quit()
 	}()
 
-	// go func() {
-	// 	for {
-	// 		<-notifyItem.ClickedCh
-
-	// 		title := "title"
-	// 		text := "text"
-	// 		err := exec.Command("notify-send", title, text, "-a", appName).Run()
-	// 		if err != nil {
-	// 			slog.Error("failed to notify", "error", err)
-	// 		}
-	// 	}
-	// }()
-
 	go func() {
+		ticker := time.NewTicker(time.Duration(*intervalFlag) * time.Second)
+		defer ticker.Stop()
 		for {
-			updateValues(availableItem)
-			<-time.Tick(updateInterval)
+			updateAndCheck(availableItem)
+			<-ticker.C
 		}
 	}()
 }
@@ -132,19 +146,83 @@ func restartApp() {
 	systray.Quit()
 }
 
-func updateValues(availableItem *systray.MenuItem) {
-	var availableDisplay string
+func updateAndCheck(availableItem *systray.MenuItem) {
 	m, err := fetchStats()
 	if err != nil {
 		slog.Error("Failed to fetch disk stats", "error", err)
-		availableDisplay = "?"
 	} else {
 		slog.Info("disk stats", "stats", m)
-		availableDisplay = displayBytes(m.available)
 	}
-	systray.SetTitle(availableDisplay)
+
+	u := evaluate(m, err, uint64(*limitFlag*gb), isTriggered)
+	isTriggered = u.triggered
+	switch u.icon {
+	case iconSetError:
+		systray.SetIcon(iconError)
+	case iconSetNormal:
+		systray.SetIcon(iconNormal)
+	}
+	if u.notifyText != "" {
+		go notify(u.notifyText)
+	}
+	availableItem.SetTitle(u.title)
+}
+
+type iconChange int
+
+const (
+	iconUnchanged iconChange = iota
+	iconSetNormal
+	iconSetError
+)
+
+// update describes the changes resulting from one measurement.
+type update struct {
+	title      string     // menu title for the available item
+	triggered  bool       // new alert state
+	icon       iconChange // icon to set, if any
+	notifyText string     // notification to send; empty means none
+}
+
+// evaluate decides what to show for a measurement.
+// It has no side effects, so it can be tested without a systray.
+func evaluate(m measurement, err error, limit uint64, wasTriggered bool) update {
+	makeAvailableTitle := func(v string) string {
+		return "Available: " + v
+	}
+
+	if err != nil {
+		return update{title: makeAvailableTitle("?"), triggered: wasTriggered}
+	}
+
+	isBelowLimit := m.available < limit
+	availableDisplay := displayBytes(m.available)
+
+	u := update{triggered: isBelowLimit}
+	if isBelowLimit && !wasTriggered {
+		u.icon = iconSetError
+		u.notifyText = fmt.Sprintf(
+			"Below storage limit: %s left (limit %s)",
+			availableDisplay,
+			displayBytes(limit),
+		)
+	} else if !isBelowLimit && wasTriggered {
+		u.icon = iconSetNormal
+	}
+
 	p := float64(m.available) / float64(m.total) * 100
-	availableItem.SetTitle(fmt.Sprintf("Available: %s (%.0f%%)", availableDisplay, p))
+	u.title = makeAvailableTitle(fmt.Sprintf("%s (%.0f%%)", availableDisplay, p))
+	if isBelowLimit {
+		u.title += " !!!"
+	}
+	return u
+}
+
+func notify(text string) {
+	err := exec.Command("notify-send", appName, text, "-a", appName).Run()
+	if err != nil {
+		slog.Error("failed to notify", "error", err)
+	}
 }
 
 func displayBytes(b uint64) string {
@@ -160,8 +238,39 @@ func fetchStats() (measurement, error) {
 		return z, err
 	}
 	m := measurement{
-		available: uint64(stat.Bavail) * uint64(stat.Bsize),
-		total:     uint64(stat.Blocks) * uint64(stat.Bsize),
+		available: uint64(stat.Bavail) * uint64(stat.Frsize),
+		total:     uint64(stat.Blocks) * uint64(stat.Frsize),
+	}
+	if m.total == 0 {
+		// e.g. pseudo filesystems like /proc
+		var z measurement
+		return z, fmt.Errorf("filesystem at %s has zero size", *pathFlag)
 	}
 	return m, nil
+}
+
+func themedPNG(in []byte, c color.Color) ([]byte, error) {
+	img, err := png.Decode(bytes.NewReader(in))
+	if err != nil {
+		return nil, err
+	}
+	bounds := img.Bounds()
+	newImg := image.NewNRGBA(bounds)
+	target := color.NRGBAModel.Convert(c).(color.NRGBA)
+
+	for y := bounds.Min.Y; y < bounds.Max.Y; y++ {
+		for x := bounds.Min.X; x < bounds.Max.X; x++ {
+			// keep the original alpha so anti-aliased edges stay smooth
+			_, _, _, a := img.At(x, y).RGBA()
+			px := target
+			px.A = uint8(uint32(target.A) * a / 0xffff)
+			newImg.SetNRGBA(x, y, px)
+		}
+	}
+
+	var buf bytes.Buffer
+	if err := png.Encode(&buf, newImg); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
 }
