@@ -120,6 +120,7 @@ func TestEvaluate(t *testing.T) {
 		m            measurement
 		err          error
 		limit        uint64
+		margin       uint64
 		wasTriggered bool
 		want         update
 	}{
@@ -154,6 +155,21 @@ func TestEvaluate(t *testing.T) {
 			want: update{title: "Available: 10.0 GB (10%)"},
 		},
 		{
+			name: "stays triggered within margin",
+			m:    measurement{available: 10_500_000_000, total: 100 * gb}, limit: limit, margin: 1 * gb, wasTriggered: true,
+			want: update{title: "Available: 10.5 GB (10%) !!!", triggered: true},
+		},
+		{
+			name: "clears exactly at limit plus margin",
+			m:    measurement{available: 11 * gb, total: 100 * gb}, limit: limit, margin: 1 * gb, wasTriggered: true,
+			want: update{title: "Available: 11.0 GB (11%)", icon: iconSetNormal},
+		},
+		{
+			name: "margin does not affect triggering",
+			m:    measurement{available: 10_500_000_000, total: 100 * gb}, limit: limit, margin: 1 * gb,
+			want: update{title: "Available: 10.5 GB (10%)"},
+		},
+		{
 			name: "zero limit disables alert",
 			m:    measurement{available: 0, total: 100 * gb}, limit: 0,
 			want: update{title: "Available: 0.0 GB (0%)"},
@@ -171,7 +187,7 @@ func TestEvaluate(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got := evaluate(tc.m, tc.err, tc.limit, tc.wasTriggered)
+			got := evaluate(tc.m, tc.err, tc.limit, tc.margin, tc.wasTriggered)
 			if got != tc.want {
 				t.Errorf("got %+v\nwant %+v", got, tc.want)
 			}
@@ -201,7 +217,39 @@ func TestEvaluateSequence(t *testing.T) {
 	}
 	triggered := false
 	for i, s := range steps {
-		u := evaluate(s.m, s.err, limit, triggered)
+		u := evaluate(s.m, s.err, limit, 0, triggered)
+		triggered = u.triggered
+		if u.icon != s.wantIcon {
+			t.Errorf("step %d: icon = %v, want %v", i, u.icon, s.wantIcon)
+		}
+		if gotNotify := u.notifyText != ""; gotNotify != s.wantNotify {
+			t.Errorf("step %d: notify = %v, want %v", i, gotNotify, s.wantNotify)
+		}
+	}
+}
+
+func TestEvaluateHysteresisSequence(t *testing.T) {
+	const limit = 10 * gb
+	const margin = 1 * gb
+	at := func(v uint64) measurement {
+		return measurement{available: v, total: 100 * gb}
+	}
+
+	steps := []struct {
+		m          measurement
+		wantIcon   iconChange
+		wantNotify bool
+	}{
+		{m: at(10_200_000_000), wantIcon: iconUnchanged},
+		{m: at(9_800_000_000), wantIcon: iconSetError, wantNotify: true},
+		{m: at(10_300_000_000), wantIcon: iconUnchanged}, // within margin, stays triggered
+		{m: at(9_700_000_000), wantIcon: iconUnchanged},  // no re-alert
+		{m: at(11_100_000_000), wantIcon: iconSetNormal},
+		{m: at(9_900_000_000), wantIcon: iconSetError, wantNotify: true}, // re-armed
+	}
+	triggered := false
+	for i, s := range steps {
+		u := evaluate(s.m, nil, limit, margin, triggered)
 		triggered = u.triggered
 		if u.icon != s.wantIcon {
 			t.Errorf("step %d: icon = %v, want %v", i, u.icon, s.wantIcon)

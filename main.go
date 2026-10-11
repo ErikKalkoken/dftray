@@ -50,6 +50,7 @@ var (
 	intervalFlag = flag.Int("interval", 10, "update interval in seconds")
 	limitFlag    = flag.Float64("limit", 10.0, "lower storage limit in GB")
 	logLevelFlag = flag.String("log-level", "warn", "log level used by the app")
+	marginFlag   = flag.Float64("margin", 1.0, "storage above the limit in GB required to clear an alert")
 	pathFlag     = flag.String("path", "/", "path used to query disk stats")
 )
 
@@ -68,6 +69,10 @@ func main() {
 
 	if !(*limitFlag >= 0) {
 		log.Fatal("limit must be 0 or larger")
+	}
+
+	if !(*marginFlag >= 0) {
+		log.Fatal("margin must be 0 or larger")
 	}
 
 	l, ok := logLevelMap[strings.ToLower(*logLevelFlag)]
@@ -154,7 +159,7 @@ func updateAndCheck(availableItem *systray.MenuItem) {
 		slog.Info("disk stats", "stats", m)
 	}
 
-	u := evaluate(m, err, uint64(*limitFlag*gb), isTriggered)
+	u := evaluate(m, err, uint64(*limitFlag*gb), uint64(*marginFlag*gb), isTriggered)
 	isTriggered = u.triggered
 	switch u.icon {
 	case iconSetError:
@@ -185,8 +190,10 @@ type update struct {
 }
 
 // evaluate decides what to show for a measurement.
+// An alert is triggered when available storage drops below limit
+// and only cleared once it rises to limit + margin or above (hysteresis).
 // It has no side effects, so it can be tested without a systray.
-func evaluate(m measurement, err error, limit uint64, wasTriggered bool) update {
+func evaluate(m measurement, err error, limit, margin uint64, wasTriggered bool) update {
 	makeAvailableTitle := func(v string) string {
 		return "Available: " + v
 	}
@@ -195,24 +202,29 @@ func evaluate(m measurement, err error, limit uint64, wasTriggered bool) update 
 		return update{title: makeAvailableTitle("?"), triggered: wasTriggered}
 	}
 
-	isBelowLimit := m.available < limit
+	var isTriggered bool
+	if wasTriggered {
+		isTriggered = m.available < limit+margin // stay triggered until clearly recovered
+	} else {
+		isTriggered = m.available < limit
+	}
 	availableDisplay := displayBytes(m.available)
 
-	u := update{triggered: isBelowLimit}
-	if isBelowLimit && !wasTriggered {
+	u := update{triggered: isTriggered}
+	if isTriggered && !wasTriggered {
 		u.icon = iconSetError
 		u.notifyText = fmt.Sprintf(
 			"Below storage limit: %s left (limit %s)",
 			availableDisplay,
 			displayBytes(limit),
 		)
-	} else if !isBelowLimit && wasTriggered {
+	} else if !isTriggered && wasTriggered {
 		u.icon = iconSetNormal
 	}
 
 	p := float64(m.available) / float64(m.total) * 100
 	u.title = makeAvailableTitle(fmt.Sprintf("%s (%.0f%%)", availableDisplay, p))
-	if isBelowLimit {
+	if isTriggered {
 		u.title += " !!!"
 	}
 	return u

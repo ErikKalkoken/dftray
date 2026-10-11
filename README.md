@@ -23,9 +23,10 @@ go install github.com/ErikKalkoken/dftray@latest
 dftray [flags]
 ```
 
-| Flag         | Default | Description                                  |
-| ------------ | ------- | -------------------------------------------- |
-| `-interval`  | `10`    | update interval in seconds                   |
-| `-limit`     | `10`    | lower storage limit in GB (0 disables alert) |
-| `-log-level` | `warn`  | log level: debug, info, warn, error          |
-| `-path`      | `/`     | path used to query disk stats                |
+| Flag         | Default | Description                                              |
+| ------------ | ------- | -------------------------------------------------------- |
+| `-interval`  | `10`    | update interval in seconds                               |
+| `-limit`     | `10`    | lower storage limit in GB (0 disables alert)             |
+| `-log-level` | `warn`  | log level: debug, info, warn, error                      |
+| `-margin`    | `1`     | storage above the limit in GB required to clear an alert |
+| `-path`      | `/`     | path used to query disk stats                            |
